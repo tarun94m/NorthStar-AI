@@ -1,0 +1,123 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id           String         @id @default(uuid()) @db.Uuid
+  email        String?        @unique
+  passwordHash String?
+  isGuest      Boolean        @default(false)
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+  conversations Conversation[]
+  settings     UserSettings?
+  usage        UsageRecord[]
+  sessions     Session[]
+  dailyQuotas  DailyGuestQuota[]
+}
+
+model Conversation {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  title     String    @default("New chat")
+  provider  String    @default("openai")
+  model     String    @default("gpt-4.1-mini")
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  lastMessageSequence Int @default(0)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages  Message[]
+  usageRecords UsageRecord[]
+  generationLock ConversationGenerationLock?
+  @@index([userId, updatedAt(sort: Desc)])
+}
+
+model Message {
+  id             String        @id @default(uuid()) @db.Uuid
+  conversationId String        @db.Uuid
+  role           String
+  content        String        @db.Text
+  status         String        @default("complete")
+  provider       String?
+  model          String?
+  inputTokens    Int?
+  outputTokens   Int?
+  estimatedCost  Float?
+  error          String?
+  sequence       Int
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  usageRecords   UsageRecord[]
+  @@unique([conversationId, sequence])
+  @@index([conversationId, sequence])
+}
+
+model UserSettings {
+  id                   String   @id @default(uuid()) @db.Uuid
+  userId               String   @unique @db.Uuid
+  provider             String   @default("openai")
+  model                String   @default("gpt-4.1-mini")
+  temperature          Float    @default(0.7)
+  responsePreferences  String   @default("") @db.Text
+  memoryEnabled        Boolean  @default(false)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+  user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model UsageRecord {
+  id             String   @id @default(uuid()) @db.Uuid
+  userId         String   @db.Uuid
+  conversationId String?  @db.Uuid
+  messageId      String?  @db.Uuid
+  provider       String
+  model          String
+  inputTokens    Int
+  outputTokens   Int
+  estimatedCost  Float
+  createdAt      DateTime @default(now())
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  conversation   Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  message        Message? @relation(fields: [messageId], references: [id], onDelete: SetNull)
+  @@index([userId, createdAt(sort: Desc)])
+}
+
+model Session {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@index([userId, expiresAt])
+}
+
+model ConversationGenerationLock {
+  conversationId String   @id @db.Uuid
+  ownerToken     String   @db.Uuid
+  expiresAt      DateTime
+  conversation  Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  @@index([expiresAt])
+}
+
+model DailyGuestQuota {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @db.Uuid
+  day       DateTime @db.Date
+  consumed  Int      @default(0)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@unique([userId, day])
+}
+
+model RateLimitCounter {
+  key       String   @id
+  totalHits Int
+  resetAt   DateTime
+  @@index([resetAt])
+}

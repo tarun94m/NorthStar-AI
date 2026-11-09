@@ -1,0 +1,11 @@
+node_modules/
+backend/src/generated/prisma/
+dist/
+.env
+test-results/
+.env.*
+!.env.example
+uploads/
+coverage/
+*.tsbuildinfo
+*.log

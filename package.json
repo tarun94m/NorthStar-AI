@@ -1,0 +1,23 @@
+{
+  "name": "independent-ai-platform",
+  "private": true,
+  "workspaces": [
+    "frontend",
+    "backend"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c blue,green \"npm:dev -w backend\" \"npm:dev -w frontend\"",
+    "build": "npm run build -w backend && npm run build -w frontend",
+    "test": "npm run test -w backend && npm run test -w frontend",
+    "db:generate": "npm run db:generate -w backend",
+    "db:migrate": "npm run db:migrate -w backend",
+    "test:browser": "node tests/browser-recovery.mjs"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "playwright-core": "^1.64.1"
+  },
+  "overrides": {
+    "zod": "^4.6.7"
+  }
+}

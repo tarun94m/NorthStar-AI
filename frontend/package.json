@@ -1,0 +1,16 @@
+{
+  "name": "@platform/frontend",
+  "private": true,
+  "type": "module",
+  "scripts": { "dev": "vite --host 0.0.0.0", "build": "tsc -b && vite build", "test": "tsx --test src/MarkdownMessage.test.tsx" },
+  "dependencies": {
+    "highlight.js": "^11.11.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-markdown": "^10.1.0",
+    "rehype-highlight": "^7.0.2",
+    "remark-gfm": "^4.0.1",
+    "zustand": "^5.0.8"
+  },
+  "devDependencies": { "@types/react": "^19.2.2", "@types/react-dom": "^19.2.2", "@vitejs/plugin-react": "^5.0.4", "typescript": "^5.9.3", "vite": "^7.1.12" }
+}
