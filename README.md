@@ -5,7 +5,7 @@ A lightweight ChatGPT-style application with React, Express, PostgreSQL, Prisma,
 ## Run locally
 
 1. Install Node.js 22+ and Docker Desktop.
-2. Copy `.env.example` to `.env` and set `JWT_SECRET` to a random value of at least 32 characters. Add `OPENAI_API_KEY` and/or `GEMINI_API_KEY` to enable the matching live provider. If neither is set, the app uses the visibly labeled local mock provider.
+2. Copy `.env.example` to `.env` and set `JWT_SECRET` to a random value of at least 32 characters. Add `OPENAI_API_KEY` and/or `GEMINI_API_KEY` to enable the matching live provider. To opt into the visibly labeled local mock provider during development, set `MOCK_PROVIDER_ENABLED=true`; it is rejected in production and is never enabled automatically.
 3. Install packages with `npm install`.
 4. Start PostgreSQL with `docker compose up -d postgres` (host port 5433, to avoid conflicting with a local PostgreSQL service on 5432).
 5. Apply the schema with `npm run db:generate` and `npm run db:migrate`.
@@ -18,7 +18,7 @@ Guests can try 12 messages per UTC day. Registering while in guest mode upgrades
 - `frontend/`: React/Vite interface; the UI talks only to the Express API. Responses use fetch-based SSE, which supports POST bodies and abort cancellation.
 - `backend/src/`: Express modules for authentication, conversation/message ownership, provider orchestration, usage estimates, structured request logging, and request IDs.
 - `backend/prisma/schema.prisma`: PostgreSQL relational schema. `User` owns conversations, settings, and usage; conversations own ordered messages. Cascades enforce cleanup.
-- `backend/src/ai.ts` and `backend/src/model-registry.ts`: provider-independent generation interface, OpenAI Responses and Google GenAI adapters, server-owned model definitions, capability and parameter constraints, and the local mock fallback.
+- `backend/src/ai.ts` and `backend/src/model-registry.ts`: provider-independent generation interface, OpenAI Responses and Google GenAI adapters, server-owned model definitions, capability and parameter constraints, and the explicitly configured local mock provider.
 - `docs/API_CONTRACT.md`: current authentication, conversation, model, chat and SSE contracts, including the Phase 2A compatibility rules.
 
 Conversation titles come from the first user message. Editing a user message deletes later turns so the conversation cannot silently retain a response to stale content. Regenerate streams a replacement from the latest user message. Token counts use provider usage when available, with a text-length estimate fallback; costs are estimates and use configurable per-million-token rates in `.env`.
@@ -33,7 +33,7 @@ Guest usage and request rate limits use PostgreSQL-backed atomic counters shared
 - [x] Registration/login/logout with Argon2id and HTTP-only JWT cookie.
 - [x] User-isolated persistent conversation CRUD and message history.
 - [x] First-message conversation titles, message editing, and response regeneration.
-- [x] Provider/model catalog, OpenAI adapter, and clearly labeled mock fallback.
+- [x] Provider/model catalog, OpenAI adapter, and clearly labeled mock provider behind explicit development/test configuration.
 - [x] Streaming, stop/cancel, timeout/error/partial statuses, and reload recovery from persisted messages.
 - [x] Per-request token usage and configurable estimated cost tracking.
 - [x] Structured request logs, request IDs, security headers, and API rate limiting.
@@ -75,9 +75,28 @@ Phase 1.2 resolved session revocation, generation coordination, guest quota race
 
 Quota is based on accepted generation attempts rather than successful completions, so users cannot retry failures or cancellations without limit. Daily boundaries use UTC. PostgreSQL is required for session records, quota enforcement, sequence allocation, and distributed generation leases; Redis remains unnecessary for this phase.
 
+### Phase 2D.1 settings and routing persistence
+
+- [x] Add additive account and conversation Auto/Manual selection preferences. Existing rows default to Manual; new registrations and guest-to-account upgrades default to Auto.
+- [x] Add owner-scoped settings and conversation-selection APIs. Preserve unavailable defaults, validate model parameters, and reject conflicting Auto/manual selectors.
+- [x] Keep guests settings-free, default guest conversations to Manual with no persistent model choice, and preserve request-only model and parameter selection.
+- [x] Add nullable per-message requested mode/model and future routing metadata while keeping `Message.provider/model` and `Conversation.provider/model` as actual response attribution.
+- [x] Require explicit `MOCK_PROVIDER_ENABLED=true` in development/test; reject it in production and never register or route to mock automatically.
+- [x] Verification: backend 82/82 and frontend 1/1 tests pass; production builds pass; Prisma schema validates; all 8 migrations are applied; backend and frontend audits report 0 vulnerabilities; browser recovery/regeneration passes with one final assistant response and usage metadata.
+
+### Phase 2D.2 intelligent routing
+
+- [x] Add deterministic task classification and a provider-independent ModelRouter before model-specific ContextBuilder work. Filter candidates by provider availability, registered capabilities, parameters, context bounds, and output reservation.
+- [x] Keep Gemini 3.8 sampling parameters aligned with its current API contract. Preserve existing saved temperatures, allow `temperature: null` to clear a preference, and default new accounts to provider sampling defaults so new Auto users can use a Gemini-only configuration.
+- [x] Preserve explicit Manual model selection without provider switching. Auto may retry another eligible non-mock provider only for classified retryable failures before the first text delta; it never switches after streaming starts.
+- [x] Persist actual provider/model attribution and safe routing metadata per assistant response. Account each provider attempt independently using unique attempt IDs and idempotent usage-outbox events; unknown failed-attempt usage remains null.
+- [x] Add grouped model selection, Auto/manual conversation controls, one-request override, availability display, short routing explanations, and per-response model attribution in the frontend.
+- [x] Add a nine-case deterministic routing evaluation dataset and blinded-comparison harness. This measures classifier/eligibility mechanics only; response quality and live fallback frequency remain unevaluated until live provider runs are configured.
+- [ ] Live OpenAI/Gemini routing, response quality, and provider fallback behavior remain unverified when provider credentials are unavailable. The router has no measured quality or latency evidence configured, so its configured preference is not a claim of optimal model selection.
+
 Deploying the session migration invalidates pre-Phase 1.2 JWT cookies because those tokens do not contain a server-side session ID; users will need to sign in or restart guest mode once after upgrade.
 
-Run browser recovery verification with the mock provider: set `MOCK_STREAM_DELAY_MS=300` in the API environment, start the API and frontend, then run `npm run test:browser`. In PowerShell, set it for the dev process with `$env:MOCK_STREAM_DELAY_MS='300'; npm run dev`. The browser test refuses to send a message unless the UI identifies the mock provider.
+Run browser recovery verification with the mock provider: set `MOCK_PROVIDER_ENABLED=true` and `MOCK_STREAM_DELAY_MS=300` in the API environment, start the API and frontend, then run `npm run test:browser`. In PowerShell, set them for the dev process with `$env:MOCK_PROVIDER_ENABLED='true'; $env:MOCK_STREAM_DELAY_MS='300'; npm run dev`. Mock mode is limited to development/test and the browser test refuses to send a message unless the UI identifies the mock provider.
 
 To enable live OpenAI locally, copy `.env.example` to `.env`, set `OPENAI_API_KEY` in that local ignored file using your editor, and restart the API. Confirm `/api/health` reports `provider: openai` and send a test request from the app. Never paste the key into chat, commit `.env`, or enable request-body/header logging.
 
@@ -128,6 +147,63 @@ Token counting references: [OpenAI tokenizer guidance](https://platform.openai.c
 - [x] Add a controlled test provider that emits and persists a known partial, blocks until abort/release, reports abort receipt, and returns explicit final usage during regeneration.
 - [x] Browser test verifies the connection remains unfinished during refresh, provider abort, active lease before disconnect, partial state and lease release after disconnect, one regenerated assistant response, provider usage metadata, and completed recovery.
 - [x] Browser recovery passed 3 of 3 consecutive runs. Backend passed 41 of 41 tests; frontend passed 1 of 1. Builds, Prisma validation/migration status, and audits passed; 0 vulnerabilities reported.
-- [ ] After the final 250 ms progress-write throttle, backend tests could not complete because the configured PostgreSQL endpoint at `localhost:5433` was unavailable (23 passed, 18 failed on database connection). The Docker daemon was unavailable; the local PostgreSQL instance on `5432` rejected the project's credentials. Frontend test passed (1/1), builds passed, and schema validation passed; final migration status and browser reruns are blocked by database availability.
+- [x] Phase 2B.2: restored the existing Docker Compose PostgreSQL 17 service on `localhost:5433` without changing ports, credentials, or volumes. Confirmed database `platform`, healthy container, valid Prisma schema, and all three migrations applied.
+- [x] Final backend regression: 43/43 passed; frontend: 1/1 passed. Production backend and frontend builds passed. Backend and frontend `npm audit` each reported 0 vulnerabilities.
+- [x] Final Playwright recovery/regeneration test passed 3/3 consecutive runs with the 250 ms persistence throttle. The controlled provider proved an active generation before refresh, observed disconnect cancellation, persisted/reopened the partial answer, regenerated exactly one completed response, and recorded provider usage.
+- [x] Crash recovery: forcibly terminated the API process after persisting a partial delta. Verified the active lease remained in PostgreSQL, simulated expiry by aging only the fixture lease row, confirmed recovery to partial, and regenerated one complete assistant response with usage metadata.
+- [x] Progress persistence and finalization are serialized. A regression test confirms a later progress write cannot race the terminal write; a failure writing usage metadata does not downgrade a message already finalized as complete. A progress persistence error aborts upstream generation and stores an explicit error state.
 - [x] ContextBuilder integration tests cover exact provider context, whole-turn boundaries, model-specific output reserves, preferences in token counting, over-budget current messages, active-versus-stale recovery, and distinct estimate versus provider usage.
-- [ ] Live OpenAI/Gemini requests remain unverified because provider credentials are not configured locally.
+- [ ] Live OpenAI/Gemini requests remain unverified: no provider API key is configured in the local environment. Mock-provider checks are deterministic application tests, not live provider verification.
+
+### Phase 2C.1 conversation summarization
+
+- [x] Add PostgreSQL-backed, coalesced summary jobs with atomic claims, renewable leases, generation fencing, retry/backoff, and recovery after worker termination. No Redis or summary API was added.
+- [x] Build versioned summaries from complete turns, preserving a contiguous coverage boundary and bounded raw recent turns. Incomplete turns wait for completion; appends and edits invalidate or requeue summaries safely. Original messages remain stored.
+- [x] Pass an active summary to ContextBuilder as separately labeled untrusted context, avoid duplicating covered messages, and omit it when it does not fit the model-specific request budget. Preserve the current user message and provider usage separately from estimates.
+- [x] Persist chat and summary usage through an idempotent PostgreSQL outbox; summary costs remain estimates, not billing records.
+- [x] Run the full backend suite (65/65), frontend suite (1/1), production builds, Prisma validation and migration status (5 migrations, up to date), and backend/frontend dependency audits (0 vulnerabilities each).
+- [x] Run browser recovery/regeneration verification 3/3 consecutive times; each run reopened after refresh with exactly one assistant response.
+- [ ] Live provider summarization remains unverified because `OPENAI_API_KEY` is not configured in the local environment. Configure `SUMMARY_MODEL_ID` and the corresponding provider credential locally before using live background summarization; transcript content and prior summaries are sent to that configured provider. Credential redaction is heuristic and is not comprehensive PII detection.
+
+At the Phase 2C.1 checkpoint, user memory, embeddings, retrieval, memory APIs/UI, RAG, uploads, and advanced tool execution had not been started.
+
+### Phase 2C.2 personal memory
+
+- [x] Reuse `UserSettings.memoryEnabled` (default `false`) and add user-owned `UserMemory` and expiring `MemorySuggestion` records. Ownership cascades on account deletion; source conversations use `SET NULL`; unique content keys and transactional approval prevent duplicate memories.
+- [x] Add owner-scoped authenticated APIs for settings, memory CRUD, suggestion generation/listing/approval/rejection. Guests receive `403 MEMORY_REGISTERED_ACCOUNT_REQUIRED`; suggestion generation uses a PostgreSQL-backed per-user hourly limit and does not run while memory is disabled.
+- [x] Add explicit user-triggered structured extraction through the common provider interface. Deterministic schema, confidence/usefulness, duplicate, secret and sensitive-data checks run before pending suggestions are saved. Approval shows exact editable text and is required before creating a memory.
+- [x] Add PostgreSQL `simple`-configuration full-text indexing of content and tags, minimum lexical rank, bounded top-K and total/per-memory token limits, and a limited recency multiplier. Retrieval is user-filtered, uncached, disabled for guests and disabled when the setting is off.
+- [x] Extend ContextBuilder with separately labeled untrusted memory context after summary context and before the latest raw conversation turn in provider message order. Memory candidates are added only after recent raw turns and summaries fit, and are model-counted. Diagnostics contain counts/timings only.
+- [x] Add expiration worker and durable `memory_extraction` usage outbox events. Category labels are flexible generic Unicode strings; UI suggestions are starting labels, not a fixed profession taxonomy. The schema remains personal-user scoped for future organizational memory separation.
+- [x] Final verification: backend 75/75 tests and frontend 1/1 test pass; production backend/frontend builds pass; Prisma schema validation passes; all 7 migrations are applied with none pending; backend and frontend `npm audit` report 0 vulnerabilities each.
+- [x] Playwright verified interrupted-stream recovery, explicit suggestion approval, memory disablement while retaining management, and manual create/edit/delete. The provider remained blocked until refresh; the partial response persisted, the lease was released, regeneration completed with usage, and refresh showed exactly one completed assistant response. The browser test waits for persisted settings and suggestion transitions.
+- [ ] Live OpenAI/Gemini memory extraction and chat remain unverified because neither provider credential is configured in this environment. Mock-provider automated/browser tests do not establish live-provider behavior.
+
+Memory search is lexical text matching, not semantic retrieval. The PostgreSQL `simple` configuration preserves token matching without English stemming and passed the included English, Spanish and French evaluation cases; it does not translate terms, infer synonyms, or guarantee good search for every writing system. Secret and sensitive-data detection uses deterministic patterns and is not comprehensive PII detection. Transcript text and stored summaries may be sent to the conversation's configured provider during explicit extraction and chat; a live OpenAI/Gemini request remains unverified unless configured locally. Local mock generation returns no candidate memories.
+
+Controls are available at `MEMORY_SUGGESTION_MIN_CONFIDENCE`, `MEMORY_SUGGESTION_MIN_USEFULNESS`, `MEMORY_SUGGESTION_MAX_PER_HOUR`, `MEMORY_SUGGESTION_TTL_HOURS`, `MEMORY_RETRIEVAL_TOP_K`, `MEMORY_RETRIEVAL_MAX_TOKENS`, `MEMORY_MAX_PER_MEMORY_TOKENS`, `MEMORY_RETRIEVAL_MIN_RANK`, and `MEMORY_EXPIRY_POLL_MS` in `.env`.
+
+### Phase 2D.2 intelligent model routing
+
+- [x] Resolve Auto and Manual selection using the documented precedence and run the provider-independent ModelRouter before model-specific ContextBuilder work. Manual selection is strict; Auto only retries eligible provider failures before the first streamed delta.
+- [x] Rank only configured, enabled models with registry-supported capabilities and parameters. Task suitability and measured quality evidence take precedence; no quality scores or capabilities are fabricated. The deterministic evaluation set checks task classification, declared capability fit, context eligibility, model distribution and latency estimates; answer quality and fallback performance remain unmeasured without live providers.
+- [x] Add Auto and provider-grouped Manual selection in the UI, per-request overrides, conversation-level Manual pinning, safe routing explanations and actual provider/model attribution on assistant responses.
+- [x] Persist per-attempt usage independently. Unknown provider usage remains null and is distinguishable from estimates, including failed fallback attempts.
+- [x] Browser verification passed: refresh during blocked streaming recovered one partial response, provider cancellation was observed, regeneration completed once with reported usage, completed state survived refresh, and an Auto override returned routing metadata for `mock:echo`.
+- [x] Backend: 97/97 tests passed. Frontend: 1/1 passed. Backend and frontend production builds passed. Prisma schema validation and client generation passed; all 11 migrations are applied with none pending.
+- [x] Offline dependency audits reported 0 vulnerabilities in both workspaces. Online npm advisory lookup could not verify registry data because the environment rejected the registry certificate chain; TLS verification was left enabled.
+- [ ] Live OpenAI and Gemini requests and comparative answer quality remain unverified because provider credentials are not configured in this environment. Mock tests establish application behavior only.
+
+### Phase 2D.3 usage dashboard and cost intelligence
+
+- [x] Add nullable pricing currency, version, and effective-time snapshots to usage outbox/records. Costs and snapshots are captured at enqueue time; retries copy the same snapshot. Existing costs remain unchanged, and legacy records retain known USD currency with unknown version/effective-time metadata.
+- [x] Preserve distinct provider-reported and estimated token counts, including unknown usage. Cost calculations remain estimates; no billing, payment, subscription, budget limit, or alert behavior is implemented.
+- [x] Extend authenticated `GET /api/usage` with bounded UTC date/provider/model/operation/status filters, stable cursor pagination, provider-attempt rows, filtered period aggregates, per-currency subtotals, and owner-scoped counts.
+- [x] Keep the legacy top-level `totalEstimatedCost` as the recent-100-record subtotal; the explicitly named `period.totalEstimatedCost` covers the selected period only when a complete single-currency total is available.
+- [x] Add the Usage & costs dashboard with date filters, request/token totals, provider/model/operation breakdowns, history pagination, unknown usage/cost indicators, and failed provider attempt details.
+- [x] Final verification: backend 107/107 tests, frontend 1/1 test, and the Playwright recovery/dashboard journey passed. The browser verified blocked generation, refresh cancellation, persisted partial recovery, duplicate-free regeneration, usage reporting and memory-operation filtering.
+- [x] Backend and frontend production builds passed. Prisma schema validation passed; all 12 configured migrations are applied and none are pending.
+- [x] Cached offline dependency audits found 0 vulnerabilities in both workspaces. Live npm advisory lookup remains unverified because the registry certificate chain could not be verified; TLS verification was left enabled.
+- [ ] Live OpenAI/Gemini provider usage and provider billing remain unverified. Mock-backed browser and automated tests do not establish live-provider behavior or actual provider bills.
+
+Default USD rates are estimates from the configured model table, not billing data. Verify or update those configured rates when provider pricing changes: [OpenAI API pricing](https://developers.openai.com/api/docs/pricing) and [Gemini API pricing](https://ai.google.dev/gemini-api/docs/pricing). The current Gemini 3.8 Flash standard-tier rates are introductory through December 31, 2026; cached-token and tool charges are outside this token-only estimate. Personal usage remains user-owned; a future organization layer should add separate ownership/aggregation relationships rather than reinterpreting personal records. Phase 2D.4 has not started.

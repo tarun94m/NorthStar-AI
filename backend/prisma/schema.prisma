@@ -7,85 +7,244 @@ datasource db {
   provider = "postgresql"
 }
 
+enum MemorySuggestionStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  EXPIRED
+}
+
+enum ModelSelectionMode {
+  AUTO
+  MANUAL
+}
+
 model User {
-  id           String         @id @default(uuid()) @db.Uuid
-  email        String?        @unique
-  passwordHash String?
-  isGuest      Boolean        @default(false)
-  createdAt    DateTime       @default(now())
-  updatedAt    DateTime       @updatedAt
-  conversations Conversation[]
-  settings     UserSettings?
-  usage        UsageRecord[]
-  sessions     Session[]
-  dailyQuotas  DailyGuestQuota[]
+  id                String             @id @default(uuid()) @db.Uuid
+  email             String?            @unique
+  passwordHash      String?
+  isGuest           Boolean            @default(false)
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+  conversations     Conversation[]
+  settings          UserSettings?
+  usage             UsageRecord[]
+  usageOutbox       UsageOutbox[]
+  sessions          Session[]
+  dailyQuotas       DailyGuestQuota[]
+  memories          UserMemory[]
+  memorySuggestions MemorySuggestion[]
 }
 
 model Conversation {
-  id        String    @id @default(uuid()) @db.Uuid
-  userId    String    @db.Uuid
-  title     String    @default("New chat")
-  provider  String    @default("openai")
-  model     String    @default("gpt-4.1-mini")
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
-  lastMessageSequence Int @default(0)
-  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  messages  Message[]
-  usageRecords UsageRecord[]
-  generationLock ConversationGenerationLock?
+  id                  String                      @id @default(uuid()) @db.Uuid
+  userId              String                      @db.Uuid
+  title               String                      @default("New chat")
+  provider            String                      @default("openai")
+  model               String                      @default("gpt-4.1-mini")
+  selectionMode       ModelSelectionMode          @default(MANUAL)
+  selectionModelId    String?
+  createdAt           DateTime                    @default(now())
+  updatedAt           DateTime                    @updatedAt
+  lastMessageSequence Int                         @default(0)
+  transcriptRevision  Int                         @default(0)
+  user                User                        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages            Message[]
+  usageRecords        UsageRecord[]
+  generationLock      ConversationGenerationLock?
+  summaries           ConversationSummary[]
+  summaryJob          ConversationSummaryJob?
+  usageOutbox         UsageOutbox[]
+  memorySuggestions   MemorySuggestion[]
+
   @@index([userId, updatedAt(sort: Desc)])
 }
 
 model Message {
-  id             String        @id @default(uuid()) @db.Uuid
-  conversationId String        @db.Uuid
-  role           String
-  content        String        @db.Text
-  status         String        @default("complete")
-  provider       String?
-  model          String?
-  inputTokens    Int?
-  outputTokens   Int?
-  estimatedCost  Float?
-  error          String?
-  sequence       Int
-  createdAt      DateTime      @default(now())
-  updatedAt      DateTime      @updatedAt
-  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
-  usageRecords   UsageRecord[]
+  id                     String              @id @default(uuid()) @db.Uuid
+  conversationId         String              @db.Uuid
+  role                   String
+  content                String              @db.Text
+  status                 String              @default("complete")
+  provider               String?
+  model                  String?
+  requestedSelectionMode ModelSelectionMode?
+  requestedModelId       String?
+  taskType               String?
+  routingPolicyVersion   String?
+  routingReasonCode      String?
+  inputTokens            Int?
+  outputTokens           Int?
+  estimatedInputTokens   Int?
+  estimatedOutputTokens  Int?
+  usageStatus            String?
+  estimatedCost          Float?
+  pricingCurrency        String?             @db.VarChar(3)
+  error                  String?
+  sequence               Int
+  createdAt              DateTime            @default(now())
+  updatedAt              DateTime            @updatedAt
+  conversation           Conversation        @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  usageRecords           UsageRecord[]
+  usageOutbox            UsageOutbox[]
+
   @@unique([conversationId, sequence])
   @@index([conversationId, sequence])
 }
 
 model UserSettings {
-  id                   String   @id @default(uuid()) @db.Uuid
-  userId               String   @unique @db.Uuid
-  provider             String   @default("openai")
-  model                String   @default("gpt-4.1-mini")
-  temperature          Float    @default(0.7)
-  responsePreferences  String   @default("") @db.Text
-  memoryEnabled        Boolean  @default(false)
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @updatedAt
-  user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id                  String             @id @default(uuid()) @db.Uuid
+  userId              String             @unique @db.Uuid
+  provider            String             @default("openai")
+  model               String             @default("gpt-4.1-mini")
+  selectionMode       ModelSelectionMode @default(MANUAL)
+  temperature         Float?
+  responsePreferences String             @default("") @db.Text
+  memoryEnabled       Boolean            @default(false)
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @updatedAt
+  user                User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model UserMemory {
+  id               String                   @id @default(uuid()) @db.Uuid
+  userId           String                   @db.Uuid
+  content          String                   @db.VarChar(2000)
+  category         String                   @db.VarChar(40)
+  tags             String[]                 @default([])
+  dedupeKey        String                   @unique
+  searchVector     Unsupported("tsvector")?
+  sourceSuggestion MemorySuggestion?        @relation("CreatedMemory")
+  createdAt        DateTime                 @default(now())
+  updatedAt        DateTime                 @updatedAt
+  lastRetrievedAt  DateTime?
+  retrievalCount   Int                      @default(0)
+  user             User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, updatedAt(sort: Desc)])
+  @@index([userId, category])
+}
+
+model MemorySuggestion {
+  id                      String                 @id @default(uuid()) @db.Uuid
+  userId                  String                 @db.Uuid
+  sourceConversationId    String?                @db.Uuid
+  sourceHighWaterSequence Int?
+  proposedContent         String                 @db.VarChar(2000)
+  proposedCategory        String                 @db.VarChar(40)
+  proposedTags            String[]               @default([])
+  status                  MemorySuggestionStatus @default(PENDING)
+  dedupeKey               String                 @unique
+  createdAt               DateTime               @default(now())
+  updatedAt               DateTime               @updatedAt
+  expiresAt               DateTime
+  decidedAt               DateTime?
+  createdMemoryId         String?                @unique @db.Uuid
+  user                    User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sourceConversation      Conversation?          @relation(fields: [sourceConversationId], references: [id], onDelete: SetNull)
+  createdMemory           UserMemory?            @relation("CreatedMemory", fields: [createdMemoryId], references: [id], onDelete: SetNull)
+
+  @@index([userId, status, expiresAt])
+  @@index([sourceConversationId, sourceHighWaterSequence])
 }
 
 model UsageRecord {
-  id             String   @id @default(uuid()) @db.Uuid
-  userId         String   @db.Uuid
-  conversationId String?  @db.Uuid
-  messageId      String?  @db.Uuid
-  provider       String
-  model          String
-  inputTokens    Int
-  outputTokens   Int
-  estimatedCost  Float
-  createdAt      DateTime @default(now())
-  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  conversation   Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
-  message        Message? @relation(fields: [messageId], references: [id], onDelete: SetNull)
+  id                    String        @id @default(uuid()) @db.Uuid
+  userId                String        @db.Uuid
+  conversationId        String?       @db.Uuid
+  messageId             String?       @db.Uuid
+  provider              String
+  model                 String
+  inputTokens           Int?
+  outputTokens          Int?
+  estimatedInputTokens  Int?
+  estimatedOutputTokens Int?
+  usageStatus           String        @default("provider_reported")
+  estimatedCost         Float?
+  pricingCurrency       String?       @db.VarChar(3)
+  pricingVersion        String?       @db.VarChar(80)
+  pricingEffectiveAt    DateTime?
+  operation             String        @default("chat")
+  attemptId             String?       @unique @db.Uuid
+  attemptNumber         Int?
+  errorCode             String?
+  idempotencyKey        String        @unique @default(uuid())
+  createdAt             DateTime      @default(now())
+  user                  User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  conversation          Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  message               Message?      @relation(fields: [messageId], references: [id], onDelete: SetNull)
+
   @@index([userId, createdAt(sort: Desc)])
+}
+
+model UsageOutbox {
+  id                    String        @id @default(uuid()) @db.Uuid
+  idempotencyKey        String        @unique
+  operation             String
+  userId                String        @db.Uuid
+  conversationId        String?       @db.Uuid
+  messageId             String?       @db.Uuid
+  provider              String
+  model                 String
+  inputTokens           Int?
+  outputTokens          Int?
+  estimatedInputTokens  Int?
+  estimatedOutputTokens Int?
+  usageStatus           String        @default("provider_reported")
+  estimatedCost         Float?
+  pricingCurrency       String?       @db.VarChar(3)
+  pricingVersion        String?       @db.VarChar(80)
+  pricingEffectiveAt    DateTime?
+  attemptId             String?       @unique @db.Uuid
+  attemptNumber         Int?
+  errorCode             String?
+  attempts              Int           @default(0)
+  availableAt           DateTime      @default(now())
+  leaseToken            String?       @db.Uuid
+  leaseExpiresAt        DateTime?
+  deliveredAt           DateTime?
+  lastErrorCode         String?
+  createdAt             DateTime      @default(now())
+  user                  User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  conversation          Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  message               Message?      @relation(fields: [messageId], references: [id], onDelete: SetNull)
+
+  @@index([deliveredAt, availableAt])
+}
+
+model ConversationSummary {
+  id                      String       @id @default(uuid()) @db.Uuid
+  conversationId          String       @db.Uuid
+  version                 Int
+  coveredThroughSequence  Int
+  sourceHighWaterSequence Int
+  transcriptRevision      Int
+  summaryText             String       @db.Text
+  status                  String       @default("active")
+  createdAt               DateTime     @default(now())
+  updatedAt               DateTime     @updatedAt
+  conversation            Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@unique([conversationId, version])
+  @@index([conversationId, status])
+  @@index([conversationId, coveredThroughSequence])
+}
+
+model ConversationSummaryJob {
+  conversationId           String       @id @db.Uuid
+  requestedThroughSequence Int          @default(0)
+  status                   String       @default("queued")
+  attempts                 Int          @default(0)
+  availableAt              DateTime     @default(now())
+  leaseToken               String?      @db.Uuid
+  leaseGeneration          BigInt       @default(0)
+  leaseExpiresAt           DateTime?
+  lastErrorCode            String?
+  createdAt                DateTime     @default(now())
+  updatedAt                DateTime     @updatedAt
+  conversation             Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([status, availableAt, leaseExpiresAt])
 }
 
 model Session {
@@ -95,23 +254,26 @@ model Session {
   revokedAt DateTime?
   createdAt DateTime  @default(now())
   user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
   @@index([userId, expiresAt])
 }
 
 model ConversationGenerationLock {
-  conversationId String   @id @db.Uuid
-  ownerToken     String   @db.Uuid
+  conversationId String       @id @db.Uuid
+  ownerToken     String       @db.Uuid
   expiresAt      DateTime
-  conversation  Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
   @@index([expiresAt])
 }
 
 model DailyGuestQuota {
-  id        String   @id @default(uuid()) @db.Uuid
-  userId    String   @db.Uuid
-  day       DateTime @db.Date
-  consumed  Int      @default(0)
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id       String   @id @default(uuid()) @db.Uuid
+  userId   String   @db.Uuid
+  day      DateTime @db.Date
+  consumed Int      @default(0)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
   @@unique([userId, day])
 }
 
@@ -119,5 +281,6 @@ model RateLimitCounter {
   key       String   @id
   totalHits Int
   resetAt   DateTime
+
   @@index([resetAt])
 }

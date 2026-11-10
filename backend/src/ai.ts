@@ -4,12 +4,13 @@ import { config } from './config.js';
 export type ChatInput = { role: 'user' | 'assistant'; content: string }[];
 export type GenerationParameters = { temperature?: number; topP?: number; maxOutputTokens?: number };
 export type GenerationRequest = { input: ChatInput; modelId: string; providerModelId: string; parameters: GenerationParameters; signal: AbortSignal; systemInstructions?: string; responsePreferences?: string };
-export type Usage = { inputTokens: number; outputTokens: number };
-export type Generation = { chunks: AsyncIterable<string>; usage: Promise<Usage> };
+export type Usage = { inputTokens: number; outputTokens: number; source?: 'provider_reported' | 'estimated' };
+export type StreamUsage = { inputTokens?: number | null; outputTokens?: number | null; source?: 'provider_reported' | 'estimated' };
+export type Generation = { chunks: AsyncIterable<string>; usage: Promise<StreamUsage> };
 export type Completion = { text: string; usage: Usage };
 
 export class ProviderError extends Error {
-  constructor(readonly code: 'PROVIDER_CONFIGURATION' | 'PROVIDER_TIMEOUT' | 'PROVIDER_CANCELLED' | 'PROVIDER_FAILURE' | 'PROVIDER_INCOMPLETE', message: string, options?: ErrorOptions) {
+  constructor(readonly code: 'PROVIDER_CONFIGURATION' | 'PROVIDER_TIMEOUT' | 'PROVIDER_CANCELLED' | 'PROVIDER_FAILURE' | 'PROVIDER_INCOMPLETE' | 'UNSUPPORTED_PARAMETER', message: string, readonly retryable = false, readonly httpStatus = code === 'PROVIDER_TIMEOUT' ? 504 : code === 'UNSUPPORTED_PARAMETER' ? 400 : 502, options?: ErrorOptions) {
     super(message, options); this.name = 'ProviderError';
   }
 }
@@ -28,12 +29,17 @@ const approximateTokens = (text: string) => Math.max(1, Math.ceil(text.length / 
 const tokenUsage = (input: ChatInput, output: string): Usage => ({
   inputTokens: input.reduce((n, m) => n + approximateTokens(m.content), 0),
   outputTokens: approximateTokens(output),
+  source: 'estimated',
 });
 function normalizeProviderError(error: unknown, signal?: AbortSignal): ProviderError {
-  if (signal?.reason instanceof Error && /timeout/i.test(signal.reason.message)) return new ProviderError('PROVIDER_TIMEOUT', 'The AI provider request timed out.');
+  if (signal?.reason instanceof Error && /timeout/i.test(signal.reason.message)) return new ProviderError('PROVIDER_TIMEOUT', 'The AI provider request timed out.', true, 504);
   if (signal?.aborted) return new ProviderError('PROVIDER_CANCELLED', 'The AI provider request was cancelled.');
   if (error instanceof ProviderError) return error;
-  return new ProviderError('PROVIDER_FAILURE', 'The AI provider request failed.');
+  const record = error as { status?: unknown; statusCode?: unknown; code?: unknown } | null;
+  const status = Number(record?.status ?? record?.statusCode);
+  const networkCode = typeof record?.code === 'string' && /^(ECONNRESET|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|ENETUNREACH|EPIPE|UND_ERR_CONNECT_TIMEOUT|UND_ERR_SOCKET)$/.test(record.code);
+  const retryable = networkCode || status === 408 || status === 425 || status === 429 || status >= 500;
+  return new ProviderError('PROVIDER_FAILURE', 'The AI provider request failed.', retryable, retryable ? 503 : 502);
 }
 
 export class MockProvider implements AIProvider {
@@ -53,6 +59,10 @@ export class MockProvider implements AIProvider {
     return { chunks, usage };
   }
   async generate(request: GenerationRequest): Promise<Completion> {
+    if (request.systemInstructions?.includes('Identify at most five stable, useful, non-sensitive facts')) {
+      const text = JSON.stringify({ suggestions: [] });
+      return { text, usage: tokenUsage(request.input, text) };
+    }
     let text = ''; for await (const part of (await this.stream(request)).chunks) text += part;
     return { text, usage: tokenUsage(request.input, text) };
   }
@@ -64,7 +74,8 @@ export class OpenAIProvider implements AIProvider {
   private client: OpenAIClient;
   constructor(client?: OpenAIClient) {
     if (!client && !config.OPENAI_API_KEY) throw new ProviderError('PROVIDER_CONFIGURATION', 'OpenAI is not configured.');
-    this.client = client ?? new OpenAI({ apiKey: config.OPENAI_API_KEY, timeout: config.PROVIDER_TIMEOUT_MS, maxRetries: 1 });
+    // Application-level fallback needs visibility into each provider attempt.
+    this.client = client ?? new OpenAI({ apiKey: config.OPENAI_API_KEY, timeout: config.PROVIDER_TIMEOUT_MS, maxRetries: 0 });
   }
   async stream(request: GenerationRequest): Promise<Generation> {
     const body = {
@@ -79,18 +90,34 @@ export class OpenAIProvider implements AIProvider {
     let stream: AsyncIterable<any>;
     try { stream = await this.client.responses.create(body, { signal: request.signal }) as AsyncIterable<any>; }
     catch (error) { throw normalizeProviderError(error, request.signal); }
-    let usageResolve!: (usage: Usage) => void;
-    const usage = new Promise<Usage>(resolve => { usageResolve = resolve; });
+    let usageResolve!: (usage: StreamUsage) => void;
+    const usage = new Promise<StreamUsage>(resolve => { usageResolve = resolve; });
     const chunks = (async function* () {
-      let observedUsage: Usage = { inputTokens: 0, outputTokens: 0 }, completed = false;
+      let observedUsage: StreamUsage = {}, completed = false;
       try {
         for await (const event of stream) {
           if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') yield event.delta;
           if (event.type === 'response.completed') {
-            observedUsage = { inputTokens: event.response?.usage?.input_tokens ?? 0, outputTokens: event.response?.usage?.output_tokens ?? 0 };
+            const responseUsage = event.response?.usage;
+            observedUsage = {
+              ...(Number.isFinite(responseUsage?.input_tokens) ? { inputTokens: responseUsage.input_tokens } : {}),
+              ...(Number.isFinite(responseUsage?.output_tokens) ? { outputTokens: responseUsage.output_tokens } : {}),
+            };
             completed = true;
           }
-          if (event.type === 'error' || event.type === 'response.failed') throw new ProviderError('PROVIDER_FAILURE', 'OpenAI reported a failed response.');
+          if (event.type === 'error' || event.type === 'response.failed') {
+            const detail = event.response?.error ?? event.error;
+            const status = Number(detail?.status ?? detail?.status_code);
+            const code = typeof detail?.code === 'string' ? detail.code.toLowerCase() : '';
+            const retryableCode = ['rate_limit_exceeded', 'server_error', 'internal_server_error', 'overloaded_error', 'temporarily_unavailable', 'service_unavailable'].includes(code);
+            const retryable = retryableCode || status === 408 || status === 425 || status === 429 || status >= 500;
+            const responseUsage = event.response?.usage;
+            observedUsage = {
+              ...(Number.isFinite(responseUsage?.input_tokens) ? { inputTokens: responseUsage.input_tokens } : {}),
+              ...(Number.isFinite(responseUsage?.output_tokens) ? { outputTokens: responseUsage.output_tokens } : {}),
+            };
+            throw new ProviderError('PROVIDER_FAILURE', 'OpenAI reported a failed response.', retryable, retryable ? 503 : 502);
+          }
           if (event.type === 'response.incomplete') throw new ProviderError('PROVIDER_INCOMPLETE', 'OpenAI returned an incomplete response.');
         }
         if (!completed) throw new ProviderError('PROVIDER_INCOMPLETE', 'OpenAI stream ended without a completion event.');
@@ -110,7 +137,7 @@ export class OpenAIProvider implements AIProvider {
         ...(request.parameters.topP === undefined ? {} : { top_p: request.parameters.topP }),
       }, { signal: request.signal });
       if (!response.output_text) throw new ProviderError('PROVIDER_INCOMPLETE', 'OpenAI returned no text response.');
-      return { text: response.output_text, usage: { inputTokens: response.usage?.input_tokens ?? 0, outputTokens: response.usage?.output_tokens ?? 0 } };
+      return { text: response.output_text, usage: { inputTokens: response.usage?.input_tokens ?? approximateTokens(request.input.map(m => m.content).join('\n')), outputTokens: response.usage?.output_tokens ?? approximateTokens(response.output_text), source: response.usage ? 'provider_reported' : 'estimated' } };
     } catch (error) { throw normalizeProviderError(error, request.signal); }
   }
 }
@@ -129,12 +156,17 @@ export class GeminiProvider implements AIProvider {
     this.clientPromise ??= (async () => {
       const moduleName = '@google/genai';
       const sdk = await import(moduleName) as { GoogleGenAI: new (options: unknown) => { models: GeminiClient } };
-      return new sdk.GoogleGenAI({ apiKey: config.GEMINI_API_KEY, httpOptions: { timeout: config.PROVIDER_TIMEOUT_MS } }).models;
+      return new sdk.GoogleGenAI({ apiKey: config.GEMINI_API_KEY, httpOptions: { timeout: config.PROVIDER_TIMEOUT_MS, retryOptions: { attempts: 1 } } }).models;
     })();
     return this.clientPromise;
   }
   private contents(input: ChatInput) {
     return input.map(item => ({ role: item.role === 'assistant' ? 'model' : 'user', parts: [{ text: item.content }] }));
+  }
+  private validateParameters(request: GenerationRequest) {
+    if (request.parameters.temperature !== undefined || request.parameters.topP !== undefined) {
+      throw new ProviderError('UNSUPPORTED_PARAMETER', 'Gemini 3.8 Flash does not support temperature or topP generation parameters.');
+    }
   }
   async countInputTokens(request: Pick<GenerationRequest, 'input' | 'providerModelId' | 'signal' | 'systemInstructions' | 'responsePreferences'>) {
     const client = await this.getClient();
@@ -145,27 +177,26 @@ export class GeminiProvider implements AIProvider {
   }
   async stream(request: GenerationRequest): Promise<Generation> {
     try {
+      this.validateParameters(request);
       const stream = await (await this.getClient()).generateContentStream({
         model: request.providerModelId,
         contents: this.contents(request.input),
         config: {
           maxOutputTokens: request.parameters.maxOutputTokens ?? config.MAX_OUTPUT_TOKENS,
           ...(composeSystemInstruction(request.systemInstructions, request.responsePreferences) ? { systemInstruction: composeSystemInstruction(request.systemInstructions, request.responsePreferences) } : {}),
-          ...(request.parameters.temperature === undefined ? {} : { temperature: request.parameters.temperature }),
-          ...(request.parameters.topP === undefined ? {} : { topP: request.parameters.topP }),
           abortSignal: request.signal,
         },
       });
-      let usageResolve!: (usage: Usage) => void;
-      const usage = new Promise<Usage>(resolve => { usageResolve = resolve; });
+      let usageResolve!: (usage: StreamUsage) => void;
+      const usage = new Promise<StreamUsage>(resolve => { usageResolve = resolve; });
       const chunks = (async function* () {
-        let observedUsage: Usage = { inputTokens: 0, outputTokens: 0 }, finishReason: string | undefined;
+        let observedUsage: StreamUsage = {}, finishReason: string | undefined;
         try {
           for await (const chunk of stream) {
             if (typeof chunk.text === 'string' && chunk.text) yield chunk.text;
             if (chunk.usageMetadata) observedUsage = {
-              inputTokens: chunk.usageMetadata.promptTokenCount ?? 0,
-              outputTokens: chunk.usageMetadata.candidatesTokenCount ?? 0,
+              ...(Number.isFinite(chunk.usageMetadata.promptTokenCount) ? { inputTokens: chunk.usageMetadata.promptTokenCount } : {}),
+              ...(Number.isFinite(chunk.usageMetadata.candidatesTokenCount) ? { outputTokens: chunk.usageMetadata.candidatesTokenCount } : {}),
             };
             const reason = chunk.candidates?.[0]?.finishReason;
             if (reason) finishReason = String(reason);
@@ -180,25 +211,26 @@ export class GeminiProvider implements AIProvider {
   }
   async generate(request: GenerationRequest): Promise<Completion> {
     try {
+      this.validateParameters(request);
       const response = await (await this.getClient()).generateContent({
         model: request.providerModelId, contents: this.contents(request.input),
         config: {
           maxOutputTokens: request.parameters.maxOutputTokens ?? config.MAX_OUTPUT_TOKENS,
           ...(composeSystemInstruction(request.systemInstructions, request.responsePreferences) ? { systemInstruction: composeSystemInstruction(request.systemInstructions, request.responsePreferences) } : {}),
-          ...(request.parameters.temperature === undefined ? {} : { temperature: request.parameters.temperature }),
-          ...(request.parameters.topP === undefined ? {} : { topP: request.parameters.topP }),
           abortSignal: request.signal,
         },
       });
       const finishReason = response.candidates?.[0]?.finishReason;
       if (!response.text || !finishReason || !['STOP', 'MAX_TOKENS'].includes(String(finishReason))) throw new ProviderError('PROVIDER_INCOMPLETE', 'Gemini returned an incomplete response.');
-      return { text: response.text, usage: { inputTokens: response.usageMetadata?.promptTokenCount ?? 0, outputTokens: response.usageMetadata?.candidatesTokenCount ?? 0 } };
+      return { text: response.text, usage: { inputTokens: response.usageMetadata?.promptTokenCount ?? approximateTokens(request.input.map(m => m.content).join('\n')), outputTokens: response.usageMetadata?.candidatesTokenCount ?? approximateTokens(response.text), source: response.usageMetadata ? 'provider_reported' : 'estimated' } };
     } catch (error) { throw normalizeProviderError(error, request.signal); }
   }
 }
 
 export class ProviderRegistry {
   constructor(private readonly providers: ReadonlyMap<string, AIProvider>) {}
+  has(id: string) { return this.providers.has(id); }
+  ids() { return [...this.providers.keys()]; }
   resolve(id: string) {
     const provider = this.providers.get(id);
     if (!provider) throw new ProviderError('PROVIDER_CONFIGURATION', `Provider '${id}' is not configured.`);
@@ -209,7 +241,7 @@ export class ProviderRegistry {
 const providers = new Map<string, AIProvider>();
 if (config.OPENAI_API_KEY) providers.set('openai', new OpenAIProvider());
 if (config.GEMINI_API_KEY) providers.set('gemini', new GeminiProvider());
-if (!providers.size) providers.set('mock', new MockProvider());
+if (config.MOCK_PROVIDER_ENABLED) providers.set('mock', new MockProvider());
 export const providerRegistry = new ProviderRegistry(providers);
-export const provider: AIProvider = providers.values().next().value as AIProvider;
+export const provider: AIProvider | undefined = providers.values().next().value as AIProvider | undefined;
 export const activeProvider = provider;

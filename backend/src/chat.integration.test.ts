@@ -108,7 +108,7 @@ test('guest sessions can route a chat through the mock model and persist provide
     assert.deepEqual(conversation.messages.map(message => message.role), ['user', 'assistant']);
     assert.equal(conversation.messages[1]?.content, 'guest reply'); assert.equal(conversation.usageRecords.length, 1);
     assert.match(routedRequest.systemInstructions, /helpful AI assistant/);
-    assert.equal(routedRequest.responsePreferences, 'Use short bullet points.');
+    assert.equal(routedRequest.responsePreferences, '', 'guest requests must not read registered-account settings');
     assert.equal(routedRequest.input[0].content, 'guest question');
     assert.equal((await prisma.dailyGuestQuota.findFirst({ where: { userId: guest.id } }))?.consumed, 1);
   } finally { await server.close(); await prisma.user.delete({ where: { id: guest.id } }); }
@@ -160,13 +160,55 @@ test('provider receives the exact recent whole turns, composed preferences, and 
     assert.equal(response.status, 200); assert.match(await response.text(), /event: done/);
     assert.deepEqual(routedRequest.input.map((item: any) => item.content), ['recent turn', 'recent answer', 'current question']);
     assert.equal(routedRequest.parameters.maxOutputTokens, 50);
-    assert.equal(routedRequest.systemInstructions, 'You are a helpful AI assistant. Be accurate, clear, and concise. Ask clarifying questions when needed.');
+    assert.match(routedRequest.systemInstructions, /You are a helpful AI assistant/);
     assert.equal(routedRequest.responsePreferences, 'Prefer compact bullet points.');
     assert.ok(countRequests.length >= 2);
     assert.ok(countRequests.every(request => request.systemInstructions === routedRequest.systemInstructions && request.responsePreferences === routedRequest.responsePreferences));
     assert.ok(countRequests.every(request => request.input.at(-1)?.content === 'current question'));
     const saved = await prisma.message.findFirst({ where: { conversationId: f.conversation.id, role: 'assistant' }, orderBy: { sequence: 'desc' } });
     assert.equal(saved?.inputTokens, 1, 'provider-reported usage stays distinct from the ContextBuilder estimate');
+  } finally { await server.close(); await prisma.user.delete({ where: { id: f.user.id } }); }
+});
+
+test('chat provider receives active summaries once as untrusted context and excludes covered raw messages', async () => {
+  const f = await fixture();
+  await prisma.message.createMany({ data: [
+    { conversationId: f.conversation.id, sequence: 1, role: 'user', content: 'old raw user fact' },
+    { conversationId: f.conversation.id, sequence: 2, role: 'assistant', content: 'old raw assistant answer' },
+  ] });
+  await prisma.conversation.update({ where: { id: f.conversation.id }, data: { lastMessageSequence: 2 } });
+  await prisma.conversationSummary.create({ data: { conversationId: f.conversation.id, version: 1, coveredThroughSequence: 2, sourceHighWaterSequence: 2, transcriptRevision: 0, summaryText: 'remember the launch decision' } });
+  let received: any;
+  const routed: AIProvider = { id: 'mock', async generate() { throw new Error('stream only'); }, async stream(request) { received = request; return generation('summary-aware reply'); } };
+  const server = await listen(createApp(prisma, { provider: routed }));
+  try {
+    const response = await fetch(`${server.base}/api/chat/stream`, { method: 'POST', headers: { Cookie: f.cookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ conversationId: f.conversation.id, content: 'continue', modelId: 'mock:echo' }) });
+    assert.equal(response.status, 200); assert.match(await response.text(), /event: done/);
+    assert.match(received.input[0].content, /untrusted conversation summary/i);
+    assert.equal(received.input[0].content.includes('remember the launch decision'), true);
+    assert.equal(received.input.some((item: any) => item.content.includes('old raw')), false, 'covered raw messages are not duplicated beside the summary');
+    assert.equal(received.systemInstructions.includes('remember the launch decision'), false);
+  } finally { await server.close(); await prisma.user.delete({ where: { id: f.user.id } }); }
+});
+
+test('summary work is enqueued atomically with terminal assistant and usage finalization at the context threshold', async () => {
+  const f = await fixture();
+  const base = modelRegistry.all().find(model => model.id === 'openai:gpt-4.1-mini')!;
+  const selected = { ...base, configured: true, enabled: true, contextWindow: 500, maxOutputTokens: 100 };
+  const provider: AIProvider = { id: 'openai', async generate() { throw new Error('stream only'); }, async countInputTokens() { return 250; }, async stream() { return generation('threshold reply'); } };
+  const server = await listen(createApp(prisma, { provider, models: new ModelRegistry([selected]) }));
+  try {
+    const response = await fetch(`${server.base}/api/chat/stream`, { method: 'POST', headers: { Cookie: f.cookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ conversationId: f.conversation.id, content: 'queue summary', modelId: selected.id, parameters: { maxOutputTokens: 50 } }) });
+    assert.equal(response.status, 200); assert.match(await response.text(), /event: done/);
+    const assistant = await prisma.message.findFirstOrThrow({ where: { conversationId: f.conversation.id, role: 'assistant' } });
+    const [job, outbox] = await Promise.all([
+      prisma.conversationSummaryJob.findUnique({ where: { conversationId: f.conversation.id } }),
+      prisma.usageOutbox.findUnique({ where: { idempotencyKey: `chat:${assistant.id}` } }),
+    ]);
+    assert.equal(assistant.status, 'complete');
+    assert.equal(job?.requestedThroughSequence, assistant.sequence);
+    assert.equal(job?.status, 'queued');
+    assert.ok(outbox, 'usage and summary work are durable at the finalization boundary');
   } finally { await server.close(); await prisma.user.delete({ where: { id: f.user.id } }); }
 });
 
@@ -272,6 +314,89 @@ test('client disconnect cancels generation and persists the partial assistant re
   } finally { controller.abort(); await server.close(); await prisma.user.delete({ where: { id: f.user.id } }); }
 });
 
+test('assistant progress writes serialize before terminal completion and survive usage-record failure', async () => {
+  const f = await fixture();
+  let releaseProgress!: () => void; let progressStarted!: () => void;
+  const gate = new Promise<void>(resolve => { releaseProgress = resolve; });
+  const started = new Promise<void>(resolve => { progressStarted = resolve; });
+  let activeWrites = 0; let maximumConcurrentWrites = 0;
+  const writeOrder: string[] = [];
+  const provider: AIProvider = {
+    id: 'mock', async generate() { throw new Error('stream only'); },
+    async stream() { return { chunks: (async function* () { yield 'first'; yield ' final'; })(), usage: Promise.resolve({ inputTokens: 13, outputTokens: 3 }) }; },
+  };
+  const server = await listen(createApp(prisma, {
+    provider,
+    persistAssistantMessage: async (id, data) => {
+      activeWrites++; maximumConcurrentWrites = Math.max(maximumConcurrentWrites, activeWrites);
+      const label = data.status ?? 'progress'; writeOrder.push(label);
+      try {
+        if (!data.status && data.content === 'first final') { progressStarted(); await gate; }
+        return await prisma.message.update({ where: { id }, data });
+      } finally { activeWrites--; }
+    },
+    createUsageRecord: async () => { throw new Error('simulated usage-store failure'); },
+  }));
+  try {
+    const request = fetch(`${server.base}/api/chat/stream`, { method: 'POST', headers: { Cookie: f.cookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ conversationId: f.conversation.id, content: 'serialize progress', modelId: 'mock:echo' }) });
+    await started;
+    const streaming = await prisma.message.findFirst({ where: { conversationId: f.conversation.id, role: 'assistant' } });
+    assert.equal(streaming?.status, 'streaming');
+    assert.equal(streaming?.content, 'first', 'the first delta was persisted before SSE headers; the later progress write remains held at its barrier');
+    assert.equal(activeWrites, 1);
+    releaseProgress();
+    const response = await request;
+    assert.equal(response.status, 200);
+    assert.match(await response.text(), /event: done/, 'the completed response is returned while usage delivery is retried from the outbox');
+    assert.equal(maximumConcurrentWrites, 1, 'progress and final writes must never overlap');
+    assert.deepEqual(writeOrder, ['progress', 'complete'], 'terminal completion must be written after the pending progress update');
+    const saved = await prisma.message.findFirst({ where: { conversationId: f.conversation.id, role: 'assistant' } });
+    assert.equal(saved?.status, 'complete', 'post-finalization usage failure must not downgrade a completed response');
+    assert.equal(saved?.content, 'first final');
+    const outbox = await prisma.usageOutbox.findUnique({ where: { idempotencyKey: `chat:${saved!.id}` } });
+    assert.ok(outbox, 'assistant completion and its usage event are committed atomically');
+    assert.equal(outbox?.deliveredAt, null, 'a failed delivery remains durable for retry');
+  } finally { releaseProgress(); await server.close(); await prisma.user.delete({ where: { id: f.user.id } }); }
+});
+
+test('assistant progress persistence failure aborts provider generation and records an error state', async () => {
+  const f = await fixture(); let providerSawAbort = false;
+  const provider: AIProvider = {
+    id: 'mock', async generate() { throw new Error('stream only'); },
+    async stream(request) {
+      request.signal.addEventListener('abort', () => { providerSawAbort = true; }, { once: true });
+      return {
+        chunks: (async function* () {
+          try {
+            yield 'unpersisted';
+            await new Promise(resolve => setTimeout(resolve, 260));
+            yield ' later';
+            await new Promise<void>(resolve => request.signal.addEventListener('abort', () => resolve(), { once: true }));
+          }
+          finally { /* generator is closed when persistence fails */ }
+        })(),
+        usage: Promise.resolve({ inputTokens: 2, outputTokens: 1 }),
+      };
+    },
+  };
+  const server = await listen(createApp(prisma, {
+    provider,
+    async persistAssistantMessage(id, data) {
+      if (!data.status) throw new Error('simulated progress database failure');
+      return prisma.message.update({ where: { id }, data });
+    },
+  }));
+  try {
+    const response = await fetch(`${server.base}/api/chat/stream`, { method: 'POST', headers: { Cookie: f.cookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ conversationId: f.conversation.id, content: 'save failure', modelId: 'mock:echo' }) });
+    assert.match(await response.text(), /PERSISTENCE_FAILURE/);
+    assert.equal(providerSawAbort, true, 'upstream generation must be cancelled when a progress write fails');
+    const saved = await prisma.message.findFirst({ where: { conversationId: f.conversation.id, role: 'assistant' } });
+    assert.equal(saved?.status, 'partial');
+    assert.equal(saved?.content, 'unpersisted later');
+    assert.equal(saved?.error, 'Response persistence failed.');
+  } finally { await server.close(); await prisma.user.delete({ where: { id: f.user.id } }); }
+});
+
 test('provider timeout persists a cancelled assistant state and releases its lease', async () => {
   const f = await fixture();
   const provider: AIProvider = { id: 'mock', async generate() { return { text: '', usage: { inputTokens: 0, outputTokens: 0 } }; }, async stream(raw) { const { signal } = params(raw);
@@ -280,9 +405,12 @@ test('provider timeout persists a cancelled assistant state and releases its lea
   const server = await listen(createApp(prisma, { provider, providerTimeoutMs: 25 }));
   try {
     const response = await fetch(`${server.base}/api/chat/stream`, { method: 'POST', headers: { Cookie: f.cookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ conversationId: f.conversation.id, content: 'timeout me', modelId: 'mock:echo' }) });
-    assert.match(await response.text(), /"status":"cancelled"/);
+    assert.equal(response.status, 504, 'a timeout before the first text delta is a pre-stream provider error');
+    assert.equal((await response.json() as any).code, 'PROVIDER_TIMEOUT');
     const assistant = await prisma.message.findFirst({ where: { conversationId: f.conversation.id, role: 'assistant' } });
-    assert.equal(assistant?.status, 'cancelled');
+    assert.equal(assistant, null, 'no assistant response is created until the first non-empty provider delta is available');
+    const attempt = await prisma.usageRecord.findFirst({ where: { userId: f.user.id, operation: 'provider_attempt' } });
+    assert.equal(attempt?.usageStatus, 'provider_reported'); assert.equal(attempt?.inputTokens, 1);
     let lock = await prisma.conversationGenerationLock.findUnique({ where: { conversationId: f.conversation.id } });
     for (let i = 0; lock && i < 30; i++) { await new Promise(resolve => setTimeout(resolve, 25)); lock = await prisma.conversationGenerationLock.findUnique({ where: { conversationId: f.conversation.id } }); }
     assert.equal(lock, null);

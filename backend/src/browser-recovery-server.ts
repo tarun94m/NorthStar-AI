@@ -4,7 +4,7 @@ import { createApp } from './app.js';
 import { config } from './config.js';
 import { prisma, pool } from './db.js';
 import { ModelRegistry, modelRegistry } from './model-registry.js';
-import type { AIProvider, GenerationRequest, Usage } from './ai.js';
+import { ProviderRegistry, type AIProvider, type GenerationRequest, type Usage } from './ai.js';
 import { randomUUID } from 'node:crypto';
 import { createToken } from './auth.js';
 
@@ -16,7 +16,7 @@ const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });
 
 const controlledProvider: AIProvider = {
   id: 'mock',
-  async generate() { throw new Error('The browser recovery fixture uses streaming only.'); },
+  async generate() { return { text: JSON.stringify({ suggestions: [{ content: 'The user prefers concise responses.', category: 'communication_preferences', tags: ['concise'], confidence: 1, usefulness: 1 }] }), usage: { inputTokens: 28, outputTokens: 24 } }; },
   async stream(request: GenerationRequest) {
     const callIndex = calls.length;
     const state: Call = { started: true, blocked: false, abortReceived: false, completed: false };
@@ -59,10 +59,11 @@ const testSessionToken = createToken({ id: testUser.id, guest: false }, testSess
 const mockDefinition = modelRegistry.all().find(model => model.id === 'mock:echo')!;
 const app = createApp(prisma as PrismaClient, {
   provider: controlledProvider,
+  providers: new ProviderRegistry(new Map([['mock', controlledProvider]])),
   models: new ModelRegistry([{ ...mockDefinition, enabled: true, configured: true }]),
   providerTimeoutMs: 120_000,
 });
-app.get('/__test/session', (_req, res) => res.json({ token: testSessionToken }));
+app.get('/__test/session', (_req, res) => res.json({ token: testSessionToken, userId: testUser.id }));
 app.get('/__test/state', async (req, res) => {
   const title = String(req.query.title ?? '');
   const conversation = await prisma.conversation.findFirst({

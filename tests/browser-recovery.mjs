@@ -49,7 +49,7 @@ async function stop(child) {
 
 try {
   await mkdir(join(root, 'test-results'), { recursive: true });
-  apiProcess = start(process.execPath, ['--import', 'tsx', 'backend/src/browser-recovery-server.ts'], { PORT: String(apiPort), LOG_LEVEL: 'info' }, 'api');
+  apiProcess = start(process.execPath, ['--import', 'tsx', 'backend/src/browser-recovery-server.ts'], { PORT: String(apiPort), LOG_LEVEL: 'info', NODE_ENV: 'test', MOCK_PROVIDER_ENABLED: 'true', OPENAI_API_KEY: '', GEMINI_API_KEY: '' }, 'api');
   await waitReady(`${apiURL}/api/health`, apiProcess, 'api');
   webProcess = start(process.execPath, [join(root, 'node_modules/vite/bin/vite.js'), '--host', '127.0.0.1', '--port', String(webPort), '--strictPort'], { API_PROXY_TARGET: apiURL, VITE_PORT: String(webPort) }, 'web', join(root, 'frontend'));
   await waitReady(baseURL, webProcess, 'web');
@@ -113,6 +113,7 @@ try {
   await row.locator('button').first().click();
   await page.getByText('Interrupted · partial response').waitFor({ timeout: 10_000 });
   assert.equal(await page.locator('article.message.assistant').count(), 1);
+  await modelSelector.selectOption('mock:echo');
 
   await page.getByRole('button', { name: /Regenerate/ }).click();
   await page.getByText('Final controlled response').waitFor({ timeout: 10_000 });
@@ -132,16 +133,123 @@ try {
   await page.getByText('Final controlled response').waitFor({ timeout: 10_000 });
   assert.equal(await page.locator('article.message.assistant').count(), 1);
   assert.equal(await page.getByText('Interrupted · partial response').count(), 0);
+
+  // The catalog selector can override this Manual conversation to Auto for a request without pinning it.
+  await modelSelector.selectOption('AUTO');
+  await page.getByRole('textbox', { name: 'Message' }).fill('Verify automatic routing for this request.');
+  const autoResponsePromise = page.waitForResponse(response => response.url().includes('/api/chat/stream'), { timeout: 10_000 });
+  await page.getByRole('button', { name: 'Send message' }).click();
+  const autoResponse = await autoResponsePromise;
+  assert.equal(autoResponse.status(), 200);
+  const autoBody = await autoResponse.text();
+  assert.match(autoBody, /"requestedSelectionMode":"AUTO"/);
+  assert.match(autoBody, /"routingPolicyVersion":"auto-v1"/);
+  assert.match(autoBody, /"provider":"mock"/);
+  const autoMetaEvent = autoBody.match(/event: meta\ndata: ([^\n]+)/);
+  assert.ok(autoMetaEvent, 'the stream should provide routing metadata');
+  const autoMeta = JSON.parse(autoMetaEvent[1]);
+  assert.equal(autoMeta.requestedSelectionMode, 'AUTO');
+  assert.equal(autoMeta.routingPolicyVersion, 'auto-v1');
+  assert.equal(autoMeta.provider, 'mock');
+  assert.ok(autoMeta.model, 'the response should identify the actual provider model');
+  const autoState = await waitForState(readState, state => state?.providerCalls?.length === 3 && state.providerCalls[2].completed && state.messages.some(message => message.role === 'user' && message.content === 'Verify automatic routing for this request.'), 'The Auto override did not finish using the configured model catalog.');
+  assert.equal(autoState.messages.filter(message => message.role === 'assistant').length, 2, 'the Auto follow-up adds one response and leaves regeneration without duplicates');
+
+  // Exercise the registered-account memory UI with deterministic provider output.
+  page.on('dialog', dialog => dialog.accept());
+  // The test database is persistent across runs, so normalize this fixture's setting.
+  const memorySettingReset = await fetch(`${apiURL}/api/memory/settings`, {
+    method: 'PATCH', headers: { Cookie: `session=${session.token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ memoryEnabled: false }),
+  });
+  assert.equal(memorySettingReset.status, 200, 'memory preference fixture should reset');
+  assert.equal((await memorySettingReset.json()).memoryEnabled, false, 'memory preference should start disabled');
+  const beforeApproval = await (await fetch(`${apiURL}/api/memories`, { headers: { Cookie: `session=${session.token}` } })).json();
+  assert.equal(beforeApproval.memories.length, 0, 'suggestion extraction must not save a memory before approval');
+  await page.getByRole('button', { name: 'Memory' }).click();
+  const memoryDialog = page.getByRole('dialog', { name: 'Memory settings' });
+  await memoryDialog.waitFor({ timeout: 10_000 });
+  const memoryToggle = memoryDialog.getByRole('checkbox', { name: 'Enable long-term memory' });
+  const enableResponse = page.waitForResponse(response => response.url().includes('/api/memory/settings') && response.request().method() === 'PATCH');
+  await memoryToggle.click();
+  assert.equal((await (await enableResponse).json()).memoryEnabled, true, 'enabling memory should persist');
+  await page.waitForFunction(() => document.querySelector('input[aria-label="Enable long-term memory"]')?.checked === true);
+  const generationResponse = page.waitForResponse(response => response.url().includes('/api/memory/suggestions/generate'));
+  await memoryDialog.getByRole('button', { name: 'Find suggestions from this conversation' }).click();
+  const generated = await (await generationResponse).json();
+  assert.equal(generated.suggestions.length, 1, `provider should create one visible candidate: ${JSON.stringify(generated)}`);
+  const suggested = memoryDialog.getByRole('textbox', { name: /Suggested memory/ });
+  await suggested.waitFor({ timeout: 10_000 });
+  assert.equal(await suggested.inputValue(), 'The user prefers concise responses.');
+  await suggested.fill('I prefer clear answers with a short summary first.');
+  await memoryDialog.getByRole('button', { name: 'Approve exact text' }).click();
+  await memoryDialog.getByText('I prefer clear answers with a short summary first.').waitFor({ timeout: 10_000 });
+  await memoryDialog.getByText('No pending suggestions.').waitFor({ timeout: 10_000 });
+  const afterApproval = await (await fetch(`${apiURL}/api/memories`, { headers: { Cookie: `session=${session.token}` } })).json();
+  assert.equal(afterApproval.memories.length, 1);
+  assert.equal(afterApproval.memories[0].content, 'I prefer clear answers with a short summary first.');
+  const disableResponse = page.waitForResponse(response => response.url().includes('/api/memory/settings') && response.request().method() === 'PATCH');
+  await memoryDialog.getByRole('checkbox', { name: 'Enable long-term memory' }).click();
+  assert.equal((await (await disableResponse).json()).memoryEnabled, false, 'disabling memory should persist');
+  await page.waitForFunction(() => document.querySelector('input[aria-label="Enable long-term memory"]')?.checked === false);
+  await memoryDialog.getByText('I prefer clear answers with a short summary first.').waitFor({ timeout: 10_000 });
+  assert.equal((await memoryDialog.getByRole('button', { name: 'Delete' }).count()), 1, 'saved memories stay manageable when retrieval is disabled');
+  await memoryDialog.locator('[aria-label="New memory content"]').fill('I enjoy logic puzzles.');
+  await memoryDialog.locator('[aria-label="New memory category"]').fill('hobbies');
+  await memoryDialog.locator('[aria-label="New memory tags"]').fill('logic, puzzles');
+  await memoryDialog.getByRole('button', { name: 'Save memory' }).click();
+  await memoryDialog.getByText('I enjoy logic puzzles.').waitFor({ timeout: 10_000 });
+  let promptIndex = 0;
+  page.removeAllListeners('dialog');
+  page.on('dialog', dialog => dialog.accept(['I enjoy puzzle games.','hobbies','logic, puzzles, games'][promptIndex++]));
+  const manualCard = memoryDialog.locator('.memory-card').filter({ hasText: 'I enjoy logic puzzles.' });
+  await manualCard.getByRole('button', { name: 'Edit' }).click();
+  await memoryDialog.getByText('I enjoy puzzle games.').waitFor({ timeout: 10_000 });
+  const editedMemory = await (await fetch(`${apiURL}/api/memories`, { headers: { Cookie: `session=${session.token}` } })).json();
+  assert.equal(editedMemory.memories.length, 2);
+  assert.ok(editedMemory.memories.some(memory => memory.content === 'I enjoy puzzle games.' && memory.category === 'hobbies'));
+  const editedCard = memoryDialog.locator('.memory-card').filter({ hasText: 'I enjoy puzzle games.' });
+  await editedCard.getByRole('button', { name: 'Delete' }).click();
+  await memoryDialog.getByText('I enjoy puzzle games.').waitFor({ state: 'detached', timeout: 10_000 });
+  const afterDelete = await (await fetch(`${apiURL}/api/memories`, { headers: { Cookie: `session=${session.token}` } })).json();
+  assert.equal(afterDelete.memories.length, 1, 'deleted memories are absent from the management API immediately');
+  await memoryDialog.getByRole('button', { name: 'Close memory settings' }).click();
+
+  // Usage outbox delivery is asynchronous; wait for the persisted record before opening its read model.
+  const persistedMemoryUsage = await waitForState(async () => {
+    const response = await fetch(`${apiURL}/api/usage?operation=memory_extraction`, { headers: { Cookie: `session=${session.token}` } });
+    if (!response.ok) return null;
+    return response.json();
+  }, result => result?.totalCount === 1 && result.usage[0]?.operation === 'memory_extraction', 'Memory extraction usage was not delivered to the reporting table.');
+  assert.equal(persistedMemoryUsage.usage[0].operation, 'memory_extraction');
+  const initialUsageResponse = page.waitForResponse(response => response.url().includes('/api/usage'), { timeout: 10_000 });
+  await page.getByRole('button', { name: 'Usage & costs' }).click();
+  const usageDashboard = page.getByRole('region', { name: 'Usage and cost dashboard' });
+  await usageDashboard.getByRole('heading', { name: 'Usage & cost' }).waitFor({ timeout: 10_000 });
+  await usageDashboard.getByRole('heading', { name: 'Usage history' }).waitFor({ timeout: 10_000 });
+  const initialUsage = await (await initialUsageResponse).json();
+  assert.ok(initialUsage.totalCount >= 3, `dashboard should load the two completed chat requests and the delivered memory extraction: ${JSON.stringify(initialUsage.period)}`);
+  assert.equal(initialUsage.period.timezone, 'UTC');
+  assert.ok(initialUsage.period.operationBreakdown.some(row => row.operation === 'memory_extraction'), 'the period aggregate should include persisted memory usage');
+  await usageDashboard.locator('.usage-table-scroll tbody tr').first().waitFor({ timeout: 10_000 });
+  const memoryUsageResponse = page.waitForResponse(response => response.url().includes('/api/usage') && response.url().includes('operation=memory_extraction'), { timeout: 10_000 });
+  await usageDashboard.getByRole('combobox', { name: 'Filter operation' }).selectOption('memory_extraction');
+  const memoryUsage = await (await memoryUsageResponse).json();
+  assert.equal(memoryUsage.totalCount, 1);
+  assert.equal(memoryUsage.usage[0].operation, 'memory_extraction');
+  await usageDashboard.locator('.usage-table-scroll tbody tr').filter({ hasText: 'Memory extraction' }).waitFor({ timeout: 10_000 });
+  assert.deepEqual(pageErrors, []);
   assert.deepEqual(pageErrors, []);
   assert.ok(firstStreamRequest, 'the browser should have issued the stream request');
   assert.equal(firstStreamRequestFinished, false, 'the first stream response must remain incomplete when refresh closes its page');
 
   console.log(JSON.stringify({
     result: 'passed',
-    steps: ['provider blocked after persisted partial chunk', 'refresh closed stream and signalled abort', 'partial state persisted and lease released', 'conversation reopened with partial state', 'regeneration completed once with reported usage', 'completed conversation survived refresh'],
+    steps: ['provider blocked after persisted partial chunk', 'refresh closed stream and signalled abort', 'partial state persisted and lease released', 'conversation reopened with partial state', 'regeneration completed once with reported usage', 'completed conversation survived refresh', 'Auto selector routed a request and returned safe route metadata', 'usage dashboard showed the period aggregate and filtered to memory extraction'],
     activeBeforeRefresh: { status: active.messages.find(message => message.role === 'assistant')?.status, generationActive: active.generationActive, providerCompleted: active.providerCalls[0].completed },
     afterRefresh: { status: interrupted.messages.find(message => message.role === 'assistant')?.status, generationActive: interrupted.generationActive, providerAbortReceived: interrupted.providerCalls[0].abortReceived },
     final: { assistantCount: assistantRows.length, inputTokens: assistantRows[0].inputTokens, outputTokens: assistantRows[0].outputTokens },
+    autoOverride: { mode: autoMeta.requestedSelectionMode, provider: autoMeta.provider, model: autoMeta.model },
     firstStreamRequestFinished,
     streamRequestFailures: streamFailures,
     serverTerminationLog: parsedTerminationLog,
@@ -157,7 +265,11 @@ try {
       await contexts[0]?.tracing.stop({ path: tracePath });
     } catch { /* tracing may already be stopped */ }
   }
-  console.error(`Browser recovery logs:\nAPI:\n${log.api.slice(-6000)}\nWEB:\n${log.web.slice(-2000)}`);
+  const relevantRequestLogs = log.api.split('\n').flatMap(line => {
+    try { const row = JSON.parse(line); if (String(row.req?.url ?? '').includes('/api/memory') || String(row.req?.url ?? '').includes('/api/usage')) return [`${row.req.method} ${row.req.url} -> ${row.res?.statusCode ?? 'error'}`]; } catch { /* ignore partial log lines */ }
+    return [];
+  });
+  console.error(`Browser recovery logs:\n${relevantRequestLogs.join('\n')}\nWEB:\n${log.web.slice(-2000)}`);
   throw error;
 } finally {
   await browser?.close();
